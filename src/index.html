@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reproductor RTSP - Cliente API</title>
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #74ABE2, #5563DE);
+      margin: 0;
+      padding: 20px;
+      color: #333;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      padding: 20px;
+    }
+    h1, h2 {
+      text-align: center;
+    }
+    .cam-controls, .controls {
+      text-align: center;
+      margin-top: 10px;
+    }
+    .cam-controls input[type="text"] {
+      padding: 8px;
+      font-size: 1rem;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      width: 150px;
+      margin-right: 10px;
+    }
+    .cam-controls button, .controls button {
+      padding: 10px 20px;
+      font-size: 1rem;
+      margin: 5px;
+      border: none;
+      border-radius: 5px;
+      background: #007bff;
+      color: #fff;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .cam-controls button:hover, .controls button:hover {
+      background: #0056b3;
+    }
+    .controls input[type="range"] {
+      width: 150px;
+      vertical-align: middle;
+      margin: 5px;
+    }
+    .video-container {
+      position: relative;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      margin-bottom: 15px;
+    }
+    canvas {
+      width: 100%;
+      display: block;
+    }
+    .loader {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: rgba(0,0,0,0.6);
+      color: #fff;
+      padding: 10px 20px;
+      border-radius: 5px;
+      font-size: 1.2rem;
+    }
+    #status {
+      text-align: center;
+      margin-top: 10px;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Reproductor RTSP - Cliente API</h1>
+    <div class="cam-controls">
+      <input type="text" id="cameraId" placeholder="ID de cámara">
+      <button id="loadCameraBtn">Cargar Cámara</button>
+    </div>
+    <div class="video-container">
+      <canvas id="videoCanvas"></canvas>
+      <div class="loader" id="loader">Cargando stream...</div>
+    </div>
+    <div class="controls">
+      <button id="soundBtn">Desactivar Sonido</button>
+      <input type="range" id="volumeSlider" min="0" max="100" value="100" title="Control de Volumen">
+      <button id="pauseBtn">Pausar</button>
+      <button id="fullscreenBtn">Pantalla Completa</button>
+    </div>
+    <div id="status">Estado: Esperando solicitud...</div>
+  </div>
+
+  <!-- Cargar JSMpeg desde CDN -->
+  <script src="https://cdn.jsdelivr.net/gh/phoboslab/jsmpeg/jsmpeg.min.js"></script>
+  <script>
+    // URL base completa de la API (ajusta según corresponda)
+    const apiBaseUrl = 'http://192.168.0.6:3000';
+
+    let player = null;
+    let currentCameraId = null;
+    let isMuted = false;
+    let isPlaying = true;
+    let currentVolume = 1;
+
+    const videoCanvas = document.getElementById('videoCanvas');
+    const statusEl = document.getElementById('status');
+    const loaderEl = document.getElementById('loader');
+    const soundBtn = document.getElementById('soundBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const volumeSlider = document.getElementById('volumeSlider');
+    const fullscreenBtn = document.getElementById('fullscreenBtn');
+    const loadCameraBtn = document.getElementById('loadCameraBtn');
+    const cameraIdInput = document.getElementById('cameraId');
+
+    function updateStatus(message) {
+      statusEl.textContent = "Estado: " + message;
+      console.log(message);
+    }
+
+    // Inicializa el reproductor con la URL WebSocket y almacena el ID de la cámara cargada
+    function initPlayer(wsUrl, camId) {
+      if (player) {
+        player.destroy();
+        player = null;
+      }
+      updateStatus("Iniciando stream...");
+      try {
+        player = new JSMpeg.Player(wsUrl, {
+          canvas: videoCanvas,
+          autoplay: true,
+          audio: true,
+          audioOut: JSMpeg.WebAudioPlayer,
+          loop: true,
+          onPlay: () => {
+            updateStatus("Reproduciendo stream");
+            loaderEl.style.display = 'none';
+          },
+          onPause: () => updateStatus("Stream pausado"),
+          onEnded: () => updateStatus("Stream finalizado"),
+          onError: (e) => updateStatus("Error: " + e.message)
+        });
+      } catch (e) {
+        updateStatus("Error al inicializar el reproductor");
+        console.error(e);
+      }
+      if (player && player.audioContext && player.audioContext.state !== 'running') {
+        player.audioContext.resume().then(() => {
+          console.log("AudioContext reanudado");
+        }).catch(err => {
+          console.error("Error al reanudar AudioContext", err);
+        });
+      }
+      if (player) {
+        player.volume = isMuted ? 0 : currentVolume;
+      }
+      currentCameraId = camId;
+    }
+
+    // Consulta la API para cargar el stream de una cámara; si ya está cargada, no reinicia
+    function loadCamera() {
+      const camId = cameraIdInput.value.trim();
+      if (!camId) {
+        updateStatus("Por favor, ingresa un ID de cámara");
+        return;
+      }
+      if (currentCameraId === camId && player) {
+        updateStatus(`La cámara ${camId} ya está cargada`);
+        return;
+      }
+      updateStatus("Consultando cámara " + camId + "...");
+      loaderEl.style.display = 'block';
+      fetch(`${apiBaseUrl}/api/stream/${camId}`)
+        .then(response => {
+          if (!response.ok) {
+            throw new Error("Error en la consulta de la cámara");
+          }
+          return response.json();
+        })
+        .then(data => {
+          if (!data.wsUrl) {
+            throw new Error("La respuesta no contiene wsUrl");
+          }
+          updateStatus(`Cámara ${camId} cargada. Stream en ${data.wsUrl}`);
+          initPlayer(data.wsUrl, camId);
+        })
+        .catch(err => {
+          console.error(err);
+          updateStatus("Error: " + err.message);
+          loaderEl.style.display = 'none';
+        });
+    }
+
+    loadCameraBtn.addEventListener('click', loadCamera);
+
+    soundBtn.addEventListener('click', () => {
+      if (!player) return;
+      if (player.audioContext && player.audioContext.state !== 'running') {
+        player.audioContext.resume().then(toggleMute)
+          .catch(err => console.error("Error al reanudar AudioContext", err));
+      } else {
+        toggleMute();
+      }
+    });
+
+    function toggleMute() {
+      isMuted = !isMuted;
+      if (player) {
+        player.volume = isMuted ? 0 : currentVolume;
+      }
+      soundBtn.textContent = isMuted ? "Activar Sonido" : "Desactivar Sonido";
+      updateStatus(isMuted ? "Audio desactivado" : "Audio activado");
+    }
+
+    volumeSlider.addEventListener('input', () => {
+      currentVolume = volumeSlider.value / 100;
+      if (!isMuted && player) {
+        player.volume = currentVolume;
+      }
+      updateStatus("Volumen: " + volumeSlider.value + "%");
+    });
+
+    pauseBtn.addEventListener('click', () => {
+      if (!player) return;
+      if (isPlaying) {
+        player.pause();
+        pauseBtn.textContent = "Reanudar";
+        updateStatus("Stream pausado");
+        isPlaying = false;
+      } else {
+        player.play();
+        pauseBtn.textContent = "Pausar";
+        updateStatus("Reproduciendo stream");
+        isPlaying = true;
+      }
+    });
+
+    fullscreenBtn.addEventListener('click', () => {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(err => {
+          updateStatus("Error al activar pantalla completa: " + err.message);
+        });
+      } else {
+        document.exitFullscreen();
+      }
+    });
+  </script>
+</body>
+</html>
