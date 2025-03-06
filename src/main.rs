@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 struct Camara {
@@ -21,6 +22,7 @@ struct StreamInfo {
     ffmpeg_process: Child,
     ws_url: String,
     broadcaster: broadcast::Sender<Vec<u8>>,
+    active_clients: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -93,6 +95,7 @@ async fn get_stream(
 
     match get_camara_by_id(pool, camara_id).await {
         Ok(Some(camara)) => {
+            // Si ya existe un stream activo para la cámara, se devuelve su URL.
             if let Some(info) = active_streams.lock().unwrap().get(&camara.id) {
                 return HttpResponse::Ok().json(serde_json::json!({
                     "id": camara.id,
@@ -100,6 +103,7 @@ async fn get_stream(
                     "wsUrl": info.ws_url,
                 }));
             }
+            // Crear el proceso ffmpeg para el stream.
             let server_host = &ws_config.server_host;
             let http_port = ws_config.server_port;
             let mut child = match create_stream(&camara, server_host, http_port) {
@@ -110,7 +114,9 @@ async fn get_stream(
                 }
             };
 
+            // Canal para transmitir datos y contador de clientes activos.
             let (tx, _) = broadcast::channel(16);
+            let active_clients = Arc::new(AtomicUsize::new(0));
             let tx_thread = tx.clone();
             if let Some(mut stdout) = child.stdout.take() {
                 std::thread::spawn(move || {
@@ -129,8 +135,25 @@ async fn get_stream(
                 ffmpeg_process: child,
                 ws_url: ws_url.clone(),
                 broadcaster: tx,
+                active_clients: active_clients.clone(),
             };
             active_streams.lock().unwrap().insert(camara.id, info);
+
+            // Monitorear: esperar 5 segundos y, si no hay clientes conectados, detener la transmisión.
+            let camara_id_clone = camara.id;
+            let active_streams_clone = data.active_streams.clone();
+            let active_clients_clone = active_clients.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if active_clients_clone.load(Ordering::SeqCst) == 0 {
+                    let mut streams = active_streams_clone.lock().unwrap();
+                    if let Some(mut info) = streams.remove(&camara_id_clone) {
+                        let _ = info.ffmpeg_process.kill();
+                        println!("No hay clientes conectados. Stream {} detenido.", camara_id_clone);
+                    }
+                }
+            });
+
             HttpResponse::Ok().json(serde_json::json!({
                 "id": camara.id,
                 "link": camara.link,
@@ -158,7 +181,6 @@ async fn delete_stream(path: web::Path<i32>, data: web::Data<AppState>) -> impl 
     }
 }
 
-
 struct StreamChunk(Vec<u8>);
 impl Message for StreamChunk {
     type Result = ();
@@ -168,11 +190,21 @@ struct MyWebSocket {
     camara_id: i32,
     hb: Instant,
     rx: broadcast::Receiver<Vec<u8>>,
+    active_clients: Arc<AtomicUsize>,
 }
 
 impl MyWebSocket {
-    fn new(camara_id: i32, rx: broadcast::Receiver<Vec<u8>>) -> Self {
-        Self { camara_id, hb: Instant::now(), rx }
+    fn new(
+        camara_id: i32,
+        rx: broadcast::Receiver<Vec<u8>>,
+        active_clients: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            camara_id,
+            hb: Instant::now(),
+            rx,
+            active_clients,
+        }
     }
     fn start_heartbeat(&self, ctx: &mut ws::WebsocketContext<Self>) {
         ctx.run_interval(Duration::from_secs(5), |_, ctx| ctx.ping(b""));
@@ -190,6 +222,10 @@ impl Actor for MyWebSocket {
                 addr.do_send(StreamChunk(chunk));
             }
         });
+    }
+    fn stopped(&mut self, _ctx: &mut Self::Context) {
+        // Al cerrar la conexión, se decrementa el contador de clientes.
+        self.active_clients.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -219,8 +255,10 @@ async fn ws_stream(
     let camara_id = path.into_inner().0;
     let streams = data.active_streams.lock().unwrap();
     if let Some(info) = streams.get(&camara_id) {
+        // Al conectar un cliente se incrementa el contador.
+        info.active_clients.fetch_add(1, Ordering::SeqCst);
         let rx = info.broadcaster.subscribe();
-        ws::start(MyWebSocket::new(camara_id, rx), &req, stream)
+        ws::start(MyWebSocket::new(camara_id, rx, info.active_clients.clone()), &req, stream)
     } else {
         Err(actix_web::error::ErrorNotFound("Stream not found"))
     }
@@ -228,12 +266,20 @@ async fn ws_stream(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let server_host = "192.168.0.6".to_string();
-    let http_port: u16 = 3000;
+    let server_host = "192.168.0.3".to_string();
+    let http_port: u16 = 3001;
     let database_url = "mysql://root:*Royner123123*@fuchibol.ddns.net/carrera";
-    let pool = MySqlPool::connect(&database_url).await.expect("DB connection error");
-    let app_state = AppState { pool, active_streams: Arc::new(Mutex::new(HashMap::new())) };
-    let ws_config = WsConfig { server_host: server_host.clone(), server_port: http_port };
+    let pool = MySqlPool::connect(&database_url)
+        .await
+        .expect("DB connection error");
+    let app_state = AppState {
+        pool,
+        active_streams: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let ws_config = WsConfig {
+        server_host: server_host.clone(),
+        server_port: http_port,
+    };
 
     HttpServer::new(move || {
         App::new()
